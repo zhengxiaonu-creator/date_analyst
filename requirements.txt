@@ -1,0 +1,12 @@
+# 数据分析Agent001 - 依赖列表
+# 快速安装（推荐国内用户使用清华镜像）:
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
+# 若遇到系统包冲突可加: --ignore-installed blinker
+
+pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+openpyxl>=3.1.0
+streamlit>=1.30.0
+openai>=1.0.0
