@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **"打开Agent"** = 运行 `bash start.sh` 启动 Streamlit（自动清理旧进程，固定 8501 端口）
 - **"上传github"** = 将当前项目最新状态提交并推送到 `https://github.com/zhengxiaonu-creator/date_analyst.git`（检查 git 状态，提交未提交变更，然后推送到 `origin main`）
-- **"总结本次更新"** = 总结自上一次版本以来的所有改动内容，询问用户本次更新到哪个版本号，然后：更新 `agent.py` 的 AGENT_NAME、`__init__.py` 的 `__version__`、`app.py` 的侧边栏版本号和 `_CHANGELOG` 列表（头部追加新条目）、`CLAUDE.md` 的架构说明；**完成后自动上传至 GitHub**（提交并推送到 `origin main`）
+- **"总结本次更新"** = 总结自上一次版本以来的所有改动内容，询问用户本次更新到哪个版本号，然后：更新 `agent.py` 的 AGENT_NAME、`__init__.py` 的 `__version__`、`app.py` 的侧边栏版本号和 `_CHANGELOG` 列表（头部追加新条目）、`CLAUDE.md` 的架构说明；**完成后询问用户是否上传至 GitHub**，用户同意后再提交并推送到 `origin main`
 - **Skill 调用约定**：当用户希望调用 Skill 时，优先选择本地已安装/项目内已有的 Skill；如果本地 Skill 不能满足需求，再优先调用 `find-skills` 搜索可安装 Skill，并在找到合适 Skill 后向用户说明再安装或使用。
 - 完成任务后直接结束，请回复"mission completed!"
 
