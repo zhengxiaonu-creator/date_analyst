@@ -27,4 +27,4 @@ __all__ = [
     "AGENT_NAME",
 ]
 
-__version__ = "0.00.03"
+__version__ = "0.00.04"

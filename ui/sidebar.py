@@ -11,6 +11,19 @@ from data_analyzer import AGENT_NAME, DataLoader
 
 _CHANGELOG = [
     {
+        "version": "V0.00.04",
+        "date": "2026-06-16",
+        "changes": [
+            "🏗️ Streamlit 多页面架构改造：从单页 st.tabs() 改为原生多页面侧边栏导航（pages/ 目录）",
+            "🧠 Agent 核心模块化拆分：新增 constants.py（枚举）、router_rules.py（规则路由）、intent_executor.py（意图执行）、conversation.py（对话管理）",
+            "🎨 新增 ui/ 渲染模块库：page_common.py（共享基础设施）、sidebar.py（侧边栏）、6 个 tab_*.py 渲染模块",
+            "🐛 修复统计分析/可视化/分组聚合页面 render() 参数错误",
+            "🐛 修复 app.py 和 sidebar.py 的 import 路径错误（pages → ui）",
+            "✅ 新增 tests/ 单元测试目录（agent / analysis / data_loader / llm_router）",
+            "☁️ 部署至 Streamlit Community Cloud",
+        ],
+    },
+    {
         "version": "V0.00.03",
         "date": "2026-06-06",
         "changes": [

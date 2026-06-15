@@ -17,7 +17,7 @@ from .visualizer import DataVisualizer
 
 logger = logging.getLogger(__name__)
 
-AGENT_NAME = "数据分析V0.00.03"
+AGENT_NAME = "数据分析V0.00.04"
 
 
 class DataAgent:
