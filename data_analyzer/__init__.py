@@ -5,6 +5,10 @@ from .analysis import DataProfiler, AdvancedAnalysis
 from .visualizer import DataVisualizer
 from .agent import DataAgent, AGENT_NAME
 from .llm_router import LLMRouter
+from .router_rules import RuleRouter
+from .intent_executor import IntentExecutor
+from .conversation import ConversationManager
+from .constants import Intent, ChartType, CompareOp
 
 __all__ = [
     "DataLoader",
@@ -14,6 +18,12 @@ __all__ = [
     "DataVisualizer",
     "DataAgent",
     "LLMRouter",
+    "RuleRouter",
+    "IntentExecutor",
+    "ConversationManager",
+    "Intent",
+    "ChartType",
+    "CompareOp",
     "AGENT_NAME",
 ]
 

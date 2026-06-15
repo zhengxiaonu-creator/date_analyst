@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
 
+from .constants import ChartType, CompareOp, Intent, MAX_CONVERSATION_HISTORY
+from .conversation import ConversationManager
 from .data_loader import DataLoader
 from .analysis import DataProfiler, AdvancedAnalysis
 from .visualizer import DataVisualizer
+
+logger = logging.getLogger(__name__)
 
 AGENT_NAME = "数据分析V0.00.03"
 
@@ -30,9 +35,30 @@ class DataAgent:
         self.visualizer: Optional[DataVisualizer] = None
         self.history: List[dict] = []
         self._llm_router = None  # LLMRouter 实例，延迟初始化
-        self._conversation_history: List[dict] = []  # LLM 对话历史
+        self._conversation = ConversationManager()
+
+        # 延迟导入的子模块
+        self._rule_router = None
+        self._intent_executor = None
+
+    # ---------- 子模块懒加载 ----------
+
+    @property
+    def rule_router(self):
+        if self._rule_router is None:
+            from .router_rules import RuleRouter
+            self._rule_router = RuleRouter(self)
+        return self._rule_router
+
+    @property
+    def intent_executor(self):
+        if self._intent_executor is None:
+            from .intent_executor import IntentExecutor
+            self._intent_executor = IntentExecutor(self)
+        return self._intent_executor
 
     # ---------- 加载数据 ----------
+
     def set_dataframe(self, df: pd.DataFrame, file_name: Optional[str] = None) -> None:
         """基于已有 DataFrame 初始化 Agent 的分析工具。"""
         self.df = df
@@ -70,27 +96,38 @@ class DataAgent:
             return (f"✅ 已加载文件: {self.file_name}\n"
                     f"   行数: {info['行数']}, 列数: {info['列数']}, "
                     f"缺失值: {info['缺失值总数']}, 内存: {info['内存占用(MB)']} MB")
+        except FileNotFoundError as e:
+            logger.warning("文件不存在: %s", e)
+            return f"❌ 文件不存在: {e}"
+        except ValueError as e:
+            logger.warning("数据加载失败: %s", e)
+            return f"❌ 数据格式错误: {e}"
         except Exception as e:
+            logger.error("加载文件时出错", exc_info=True)
             return f"❌ 加载失败: {e}"
 
     # ---------- LLM 配置 ----------
+
     def configure_llm(self, api_key: str, base_url: str, model: str) -> None:
         """启用 LLM 语义路由。需要在加载数据之后调用。"""
         if self.df is None:
+            logger.warning("configure_llm 在无数据时被调用，已忽略")
             return
         from .llm_router import LLMRouter
         self._llm_router = LLMRouter(api_key, base_url, model, self.df,
                                      file_name=self.file_name)
+        self._conversation.clear()
 
     def get_conversation_history(self) -> List[dict]:
         """返回 LLM 对话历史副本。"""
-        return list(self._conversation_history)
+        return self._conversation.get_history()
 
     def set_conversation_history(self, history: Optional[List[dict]]) -> None:
         """设置 LLM 对话历史。"""
-        self._conversation_history = list(history or [])
+        self._conversation.set_history(history)
 
     # ---------- 分析结果 API ----------
+
     def overview(self) -> str:
         if self.profiler is None:
             return self._no_data_msg()
@@ -130,7 +167,11 @@ class DataAgent:
         try:
             result = self.advanced.groupby_agg(group_col, value_col)
             return f"按 {group_col} 聚合 {value_col}:\n" + result.head(15).to_string()
+        except KeyError as e:
+            logger.warning("分组聚合列不存在: %s", e)
+            return f"❌ 列不存在: {e}"
         except Exception as e:
+            logger.error("分组聚合失败", exc_info=True)
             return f"❌ 分组聚合失败: {e}"
 
     def outliers(self, column: str) -> str:
@@ -140,7 +181,11 @@ class DataAgent:
             odf = self.advanced.outliers(column)
             return (f"列 '{column}' 的异常值 (IQR 方法): {len(odf)} 行\n"
                     + odf.head(10).to_string())
+        except KeyError as e:
+            logger.warning("异常值检测列不存在: %s", e)
+            return f"❌ 列不存在: {e}"
         except Exception as e:
+            logger.error("异常值检测失败", exc_info=True)
             return f"❌ 异常值检测失败: {e}"
 
     def query_data(
@@ -191,7 +236,11 @@ class DataAgent:
                 case_sensitive=case_sensitive,
                 limit=limit,
             )
+        except KeyError as e:
+            logger.warning("查询列不存在: %s", e)
+            return f"❌ 查询失败: {e}"
         except Exception as e:
+            logger.error("查询失败", exc_info=True)
             return f"❌ 查询失败: {e}"
 
         desc = self._format_query_desc(keyword, valid_columns, valid_conditions)
@@ -208,28 +257,35 @@ class DataAgent:
         if self.visualizer is None:
             return self._no_data_msg()
         try:
-            chart_type = chart_type.lower()
-            if chart_type in ("hist", "histogram"):
+            mapped = ChartType.from_user_input(chart_type)
+            if mapped is None:
+                return self._tool_missing_msg(f"图表类型 {chart_type}")
+
+            if mapped == ChartType.HISTOGRAM:
                 return f"📉 已生成直方图 → {self.visualizer.histogram(args[0])}"
-            if chart_type in ("box", "boxplot"):
+            elif mapped == ChartType.BOXPLOT:
                 col = args[0]
                 group_by = args[1] if len(args) > 1 else None
                 return f"📦 已生成箱线图 → {self.visualizer.boxplot(col, group_by)}"
-            if chart_type in ("bar", "barplot"):
+            elif mapped == ChartType.BARPLOT:
                 return f"📊 已生成条形图 → {self.visualizer.barplot(args[0])}"
-            if chart_type in ("heatmap", "heat", "热力图"):
+            elif mapped == ChartType.HEATMAP:
                 path = self.visualizer.heatmap()
                 return f"🗺️  已生成热力图 → {path}" if path else "⚠️  数值列不足"
-            if chart_type == "scatter":
+            elif mapped == ChartType.SCATTER:
                 return f"🔵 已生成散点图 → {self.visualizer.scatter(args[0], args[1])}"
-            if chart_type in ("auto", "report", "自动", "自动图表"):
+            elif mapped == ChartType.AUTO:
                 files = self.visualizer.auto_report()
                 return f"📄 已生成 {len(files)} 张图表:\n" + "\n".join(f"  - {f}" for f in files)
-            return self._tool_missing_msg(f"图表类型 {chart_type}")
+        except (IndexError, TypeError) as e:
+            logger.warning("图表参数不足: chart_type=%s, args=%s", chart_type, args)
+            return f"❌ 图表参数不足: {e}"
         except Exception as e:
+            logger.error("生成图表失败: chart_type=%s", chart_type, exc_info=True)
             return f"❌ 生成图表失败: {e}"
 
     # ---------- 自然语言路由 ----------
+
     def ask(self, question: str) -> str:
         q = question.strip().lower()
         if not q:
@@ -253,188 +309,13 @@ class DataAgent:
                 return reply
             question = reply.replace("__LLM_ERROR__", "", 1).strip() or question
 
-        return self._ask_by_rules(question)
-
-    def _ask_by_rules(self, question: str) -> str:
-        """关键词/正则路由。LLM 未启用或调用失败时使用。"""
-        q = question.strip().lower()
-
-        if any(k in q for k in ("自动图表", "自动报告", "生成报告", "auto report", "auto chart")):
-            return self.chart("auto")
-        if any(k in q for k in ("热力图", "heatmap", "相关性图")):
-            return self.chart("heatmap")
-
-        hist_match = re.search(
-            r"(?:画|绘制|生成)?\s*(?:直方图|histogram|hist)\s*(?:图)?\s*[:：]?\s*([\w一-龥_]+)",
-            question,
-        )
-        if hist_match or "直方图" in q:
-            col = hist_match.group(1) if hist_match else self._pick_numeric(q)
-            return self.chart("histogram", col) if col else "⚠️  请指定数值列名"
-
-        box_match = re.search(
-            r"(?:箱线图|boxplot)\s*[:：]?\s*([\w一-龥_]+)\s*(?:按|by|分组)?\s*([\w一-龥_]+)?",
-            question,
-        )
-        if box_match:
-            return self.chart("boxplot", box_match.group(1), box_match.group(2))
-        if "箱线图" in q:
-            col = self._pick_numeric(q)
-            return self.chart("boxplot", col) if col else "⚠️  请指定数值列名"
-
-        bar_match = re.search(
-            r"(?:条形图|柱状图|bar|barplot)\s*[:：]?\s*([\w一-龥_]+)",
-            question,
-        )
-        if bar_match or any(k in q for k in ("条形图", "柱状图")):
-            col = bar_match.group(1) if bar_match else self._pick_categorical(q)
-            return self.chart("barplot", col) if col else "⚠️  请指定列名"
-
-        scatter_match = re.search(
-            r"(?:散点图|scatter)\s*[:：]?\s*([\w一-龥_]+)\s*[和与,，\s]*\s*([\w一-龥_]+)",
-            question,
-        )
-        if scatter_match or "散点图" in q:
-            if scatter_match:
-                return self.chart("scatter", scatter_match.group(1), scatter_match.group(2))
-            nums = [c for c in (self.df.columns if self.df is not None else []) if c.lower() in q]
-            if len(nums) >= 2:
-                return self.chart("scatter", nums[0], nums[1])
-            return "⚠️  请指定两个数值列，例如: 画 年龄 和 销售额 散点图"
-
-        group_match = re.search(
-            r"(?:按|group by)\s*([\w一-龥_]+)\s*(?:聚合|分组|统计)?\s*([\w一-龥_]+)?",
-            question,
-        )
-        if group_match and self.df is not None:
-            g = group_match.group(1)
-            v = group_match.group(2) or self._pick_numeric(q)
-            return self.groupby_agg(g, v) if v else "⚠️  请指定要聚合的数值列"
-
-        outlier_match = re.search(
-            r"(?:异常值|outlier)\s*[:：]?\s*([\w一-龥_]+)", question,
-        )
-        if outlier_match or "异常值" in q:
-            col = outlier_match.group(1) if outlier_match else self._pick_numeric(q)
-            return self.outliers(col) if col else "⚠️  请指定数值列名"
-
-        query_reply = self._try_query_by_rules(question)
-        if query_reply is not None:
-            return query_reply
-
-        if any(k in q for k in ("相关", "correlation", "corr", "热力")):
-            return self.correlation()
-        if any(k in q for k in ("分类列", "categorical", "类别")):
-            return self.categorical()
-        if any(k in q for k in ("统计", "summary", "describe", "数值", "数字列")):
-            return self.summary()
-        if any(k in q for k in ("完整报告", "full report", "report", "概览", "overview", "看看", "查看数据", "info")):
-            return self.overview()
-
-        return (
-            f"🤖 {self.name} 还没完全理解你的问题：'{question}'\n"
-            f"试试这些关键词：概览 / 统计 / 相关性 / 自动图表 / 按 X 聚合 Y\n"
-            f"输入 'help' 查看完整命令列表。"
-        )
-
-    # ---------- 辅助 ----------
-    def _pick_numeric(self, q: str) -> Optional[str]:
-        if self.df is None:
-            return None
-        for c in self.df.select_dtypes(include="number").columns:
-            if str(c).lower() in q:
-                return c
-        return None
-
-    def _pick_categorical(self, q: str) -> Optional[str]:
-        if self.df is None:
-            return None
-        for c in self.df.select_dtypes(exclude="number").columns:
-            if str(c).lower() in q:
-                return c
-        return None
-
-    def _try_query_by_rules(self, question: str) -> Optional[str]:
-        """用简单规则识别查询/搜索需求。"""
-        if self.df is None:
-            if any(k in question for k in ("查找", "查询", "搜索", "找出", "筛选", "过滤", "检索")):
-                return self._no_data_msg()
-            return None
-
-        q = question.strip()
-        q_lower = q.lower()
-        triggers = ("查找", "查询", "搜索", "找出", "筛选", "过滤", "检索")
-        if not any(k in q_lower for k in triggers):
-            return None
-
-        column = self._find_mentioned_column(q_lower)
-        compare_ops = [
-            ("大于等于", "gte"), ("不小于", "gte"), (">=", "gte"),
-            ("小于等于", "lte"), ("不大于", "lte"), ("<=", "lte"),
-            ("大于", "gt"), (">", "gt"),
-            ("小于", "lt"), ("<", "lt"),
-        ]
-        if column:
-            for token, op in compare_ops:
-                if token in q:
-                    value = q.split(token, 1)[1].strip(" 的数据记录行。。，,：:")
-                    return self.query_data(conditions=[{"column": column, "op": op, "value": value}])
-
-            for token, op in (("不包含", "not_contains"), ("包含", "contains"), ("含有", "contains"), ("包括", "contains")):
-                if token in q:
-                    value = q.split(token, 1)[1].strip(" 的数据记录行。。，,：:")
-                    return self.query_data(conditions=[{"column": column, "op": op, "value": value}])
-
-            for token in ("等于", "为", "是", "=", "=="):
-                if token in q:
-                    value = q.split(token, 1)[1].strip(" 的数据记录行。。，,：:")
-                    return self.query_data(conditions=[{"column": column, "op": "eq", "value": value}], match_mode="exact")
-
-        keyword = q
-        for token in triggers:
-            keyword = keyword.replace(token, " ")
-        keyword = keyword.strip(" 的数据记录行。。，,：:")
-        if column and keyword.startswith(str(column)):
-            keyword = keyword[len(str(column)):].strip(" 的数据记录行。。，,：:")
-        return self.query_data(keyword=keyword) if keyword else None
-
-    def _find_mentioned_column(self, q: str) -> Optional[str]:
-        if self.df is None:
-            return None
-        for c in self.df.columns:
-            if str(c).lower() in q:
-                return c
-        return None
-
-    @staticmethod
-    def _format_query_desc(
-        keyword: Optional[str],
-        columns: list[str],
-        conditions: list[dict],
-    ) -> str:
-        parts = []
-        op_names = {
-            "eq": "=", "ne": "!=", "contains": "包含", "not_contains": "不包含",
-            "gt": ">", "gte": ">=", "lt": "<", "lte": "<=",
-            "isna": "为空", "notna": "非空",
-        }
-        for condition in conditions:
-            op = str(condition.get("op", "eq")).lower()
-            if op in ("isna", "notna", "is_null", "not_null"):
-                parts.append(f"{condition.get('column')} {op_names.get(op, op)}")
-            else:
-                parts.append(
-                    f"{condition.get('column')} {op_names.get(op, op)} {condition.get('value')}"
-                )
-        if keyword not in (None, ""):
-            scope = f"（限定列：{', '.join(map(str, columns))}）" if columns else "（全表）"
-            parts.append(f"关键词 {keyword}{scope}")
-        return "；".join(parts) if parts else "无"
+        return self.rule_router.ask_by_rules(question)
 
     # ---------- LLM 辅助方法 ----------
+
     def _ask_llm(self, question: str) -> str:
         """通过 LLM 进行语义路由并执行对应操作。"""
-        result = self._llm_router.route(question, self._conversation_history)
+        result = self._llm_router.route(question, self._conversation.get_history())
 
         intent = result.get("intent", "error")
         params = result.get("params", {})
@@ -444,22 +325,19 @@ class DataAgent:
             return f"__LLM_ERROR__{question}"
 
         # 记录对话历史
-        self._conversation_history.append({"role": "user", "content": question})
+        self._conversation.append("user", question)
 
-        if intent in ("unsupported", "tool_missing"):
+        if intent in (Intent.UNSUPPORTED, Intent.TOOL_MISSING):
             reply = self._tool_missing_msg(params.get("requested", question))
-            self._conversation_history.append({"role": "assistant", "content": reply})
+            self._conversation.append("assistant", reply)
             return reply
 
-        if intent == "chat":
+        if intent == Intent.CHAT:
             reply = commentary or "你好！我是数据分析助手，可以帮你分析数据。"
-            self._conversation_history.append({"role": "assistant", "content": reply})
+            self._conversation.append("assistant", reply)
             return reply
 
-        try:
-            exec_result = self._execute_intent(intent, params)
-        except Exception as e:
-            exec_result = f"❌ 执行失败: {e}"
+        exec_result = self.intent_executor.execute(intent, params)
 
         # 拼接 LLM 回复和执行结果
         if commentary and exec_result:
@@ -469,53 +347,10 @@ class DataAgent:
         else:
             reply = exec_result
 
-        self._conversation_history.append({"role": "assistant", "content": reply})
+        self._conversation.append("assistant", reply)
         return reply
 
-    def _execute_intent(self, intent: str, params: dict) -> str:
-        """将 LLM 返回的意图映射到具体的分析方法。"""
-        if intent == "overview":
-            return self.overview()
-        elif intent == "summary":
-            return self.summary()
-        elif intent == "categorical":
-            return self.categorical()
-        elif intent == "correlation":
-            return self.correlation()
-        elif intent == "groupby_agg":
-            g = params.get("group_col", "")
-            v = params.get("value_col", "")
-            g = self._validate_column(g, "categorical")
-            v = self._validate_column(v, "numeric")
-            if not g or not v:
-                return "⚠️  请指定有效的分组列和数值列。"
-            return self.groupby_agg(g, v)
-        elif intent == "outliers":
-            col = self._validate_column(params.get("column", ""), "numeric")
-            if not col:
-                return "⚠️  请指定有效的数值列名。"
-            return self.outliers(col)
-        elif intent == "chart":
-            chart_type = params.get("chart_type", "auto")
-            columns = params.get("columns", [])
-            validated = [self._validate_column(c) for c in columns]
-            validated = [c for c in validated if c is not None]
-            return self.chart(chart_type, *validated)
-        elif intent == "query_data":
-            return self.query_data(
-                keyword=params.get("keyword"),
-                columns=params.get("columns") or [],
-                conditions=params.get("conditions") or [],
-                match_mode=params.get("match_mode", "contains"),
-                case_sensitive=bool(params.get("case_sensitive", False)),
-                limit=params.get("limit", 20),
-            )
-        elif intent == "chat":
-            return params.get("commentary", "") or "你好！我是数据分析助手，可以帮你分析数据。"
-        elif intent in ("unsupported", "tool_missing"):
-            return self._tool_missing_msg(params.get("requested", ""))
-        else:
-            return self._tool_missing_msg(intent)
+    # ---------- 列名校验 ----------
 
     def _validate_column(self, col_name: str, expected_type: Optional[str] = None) -> Optional[str]:
         """校验列名是否存在，支持模糊匹配。返回实际列名或 None。"""
@@ -526,15 +361,17 @@ class DataAgent:
         if col_name in self.df.columns:
             col = col_name
         # 忽略大小写匹配
-        elif col_name.lower() in {c.lower(): c for c in self.df.columns}:
-            col = {c.lower(): c for c in self.df.columns}[col_name.lower()]
-        # 子串模糊匹配
         else:
-            col = None
-            for c in self.df.columns:
-                if col_name.lower() in c.lower() or c.lower() in col_name.lower():
-                    col = c
-                    break
+            col_map = {c.lower(): c for c in self.df.columns}
+            if col_name.lower() in col_map:
+                col = col_map[col_name.lower()]
+            else:
+                # 子串模糊匹配
+                col = None
+                for c in self.df.columns:
+                    if col_name.lower() in c.lower() or c.lower() in col_name.lower():
+                        col = c
+                        break
 
         if col is None:
             return None
@@ -546,6 +383,8 @@ class DataAgent:
             return None
 
         return col
+
+    # ---------- 工具方法 ----------
 
     @staticmethod
     def _no_data_msg() -> str:
@@ -576,7 +415,27 @@ class DataAgent:
             "  🚪 退出           → '退出' / 'quit'"
         )
 
+    @staticmethod
+    def _format_query_desc(
+        keyword: Optional[str],
+        columns: list[str],
+        conditions: list[dict],
+    ) -> str:
+        parts = []
+        for condition in conditions:
+            op = str(condition.get("op", "eq")).lower()
+            col = condition.get("column")
+            if op in ("isna", "notna", "is_null", "not_null"):
+                parts.append(f"{col} {CompareOp.display_name(op)}")
+            else:
+                parts.append(f"{col} {CompareOp.display_name(op)} {condition.get('value')}")
+        if keyword not in (None, ""):
+            scope = f"（限定列：{', '.join(map(str, columns))}）" if columns else "（全表）"
+            parts.append(f"关键词 {keyword}{scope}")
+        return "；".join(parts) if parts else "无"
+
     # ---------- 交互式会话 ----------
+
     def chat(self):
         print("=" * 60)
         print(f"🤖 {self.name} - 有什么可以帮你的？")

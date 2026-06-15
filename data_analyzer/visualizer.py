@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -12,6 +13,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
+logger = logging.getLogger(__name__)
+
 
 def _setup_chinese_font():
     candidates = ["PingFang SC", "Heiti TC", "STHeiti", "Songti SC",
@@ -21,9 +24,18 @@ def _setup_chinese_font():
     plt.rcParams["axes.unicode_minus"] = False
 
 
-# 先设置 seaborn 主题，再配置中文字体（顺序关键：sns.set_theme 会重置 rcParams）
-sns.set_theme(style="whitegrid", palette="viridis")
-_setup_chinese_font()
+# 模块级标志，确保只初始化一次
+_theme_initialized: bool = False
+
+
+def _init_theme_once():
+    """惰性初始化 seaborn 主题和中文字体（首次调用时执行）。"""
+    global _theme_initialized
+    if _theme_initialized:
+        return
+    sns.set_theme(style="whitegrid", palette="viridis")
+    _setup_chinese_font()
+    _theme_initialized = True
 
 
 class DataVisualizer:
@@ -33,6 +45,7 @@ class DataVisualizer:
     """
 
     def __init__(self, df: pd.DataFrame, output_dir: str = "outputs"):
+        _init_theme_once()
         self.df = df
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -171,23 +184,23 @@ class DataVisualizer:
         for col in numeric_cols:
             try:
                 files.append(self.histogram(col))
-            except Exception as e:
-                print(f"  ⚠️  跳过 histogram({col}): {e}")
+            except Exception:
+                logger.warning("跳过 histogram(%s)", col, exc_info=True)
         for col in cat_cols:
             try:
                 files.append(self.barplot(col))
-            except Exception as e:
-                print(f"  ⚠️  跳过 barplot({col}): {e}")
+            except Exception:
+                logger.warning("跳过 barplot(%s)", col, exc_info=True)
         try:
             path = self.heatmap()
             if path:
                 files.append(path)
-        except Exception as e:
-            print(f"  ⚠️  跳过 heatmap: {e}")
+        except Exception:
+            logger.warning("跳过 heatmap", exc_info=True)
         try:
             files.append(self.missing_map())
-        except Exception as e:
-            print(f"  ⚠️  跳过 missing_map: {e}")
+        except Exception:
+            logger.warning("跳过 missing_map", exc_info=True)
         return files
 
     # ---------- 给 Streamlit 用的 figure 列表 ----------
@@ -204,20 +217,20 @@ class DataVisualizer:
             try:
                 figures.append((f"📉 {col} — 分布直方图", self.fig_histogram(col)))
             except Exception:
-                continue
+                logger.warning("跳过 fig_histogram(%s)", col, exc_info=True)
         for col in cat_cols:
             try:
                 figures.append((f"📊 {col} — 频数条形图", self.fig_barplot(col)))
             except Exception:
-                continue
+                logger.warning("跳过 fig_barplot(%s)", col, exc_info=True)
         try:
             fig = self.fig_heatmap()
             if fig is not None:
                 figures.append(("🔥 数值列相关性热力图", fig))
         except Exception:
-            pass
+            logger.warning("跳过 fig_heatmap", exc_info=True)
         try:
             figures.append(("❓ 缺失值分布", self.fig_missing_map()))
         except Exception:
-            pass
+            logger.warning("跳过 fig_missing_map", exc_info=True)
         return figures

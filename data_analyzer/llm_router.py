@@ -1,28 +1,49 @@
 """LLM 语义路由模块 — 使用 OpenAI 兼容 API 理解自然语言并路由到对应分析功能。"""
 
+from __future__ import annotations
+
 import json
+import logging
 import re
+import time
 from typing import Optional
 
 import pandas as pd
 from openai import OpenAI
 
+from .constants import (
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MAX_RETRIES,
+    DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_TIMEOUT,
+    Intent,
+)
+
+logger = logging.getLogger(__name__)
+
 
 class LLMRouter:
     """基于 LLM 的自然语言意图路由器。"""
 
-    VALID_INTENTS = {
-        "overview", "summary", "categorical", "correlation",
-        "groupby_agg", "outliers", "chart", "query_data", "chat", "unsupported",
-    }
+    VALID_INTENTS = Intent.valid_intents()
 
-    def __init__(self, api_key: str, base_url: str, model: str,
-                 df: pd.DataFrame, file_name: Optional[str] = None):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = DEFAULT_LLM_BASE_URL,
+        model: str = DEFAULT_LLM_MODEL,
+        df: pd.DataFrame | None = None,
+        file_name: Optional[str] = None,
+        timeout: float = DEFAULT_LLM_TIMEOUT,
+        max_retries: int = DEFAULT_LLM_MAX_RETRIES,
+    ):
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.df = df
         self.file_name = file_name
-        self.system_prompt = self._build_system_prompt()
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.system_prompt = self._build_system_prompt() if df is not None else ""
 
     # ------------------------------------------------------------------
     # 系统提示构建
@@ -97,23 +118,23 @@ class LLMRouter:
         lines = ["当前数据集信息："]
         if self.file_name:
             lines.append(f"- 文件: {self.file_name}")
-        lines.append(f"- 行数: {len(self.df)}, 列数: {len(self.df.columns)}")
-
-        numeric_cols = [str(c) for c in self.df.select_dtypes(include="number").columns]
-        categorical_cols = [str(c) for c in self.df.select_dtypes(exclude="number").columns]
-        lines.append(f"- 数值列: {', '.join(numeric_cols) if numeric_cols else '无'}")
-        lines.append(f"- 分类/非数值列: {', '.join(categorical_cols) if categorical_cols else '无'}")
-        lines.append("- 列信息：")
-        for col in self.df.columns:
-            dtype = str(self.df[col].dtype)
-            null_count = int(self.df[col].isna().sum())
-            unique_count = int(self.df[col].nunique())
-            sample_vals = self.df[col].dropna().head(3).tolist()
-            sample_str = ", ".join(str(v) for v in sample_vals)
-            lines.append(
-                f"  * {col} (类型: {dtype}, 缺失: {null_count}, "
-                f"唯一值: {unique_count}) 示例: {sample_str}"
-            )
+        if self.df is not None:
+            lines.append(f"- 行数: {len(self.df)}, 列数: {len(self.df.columns)}")
+            numeric_cols = [str(c) for c in self.df.select_dtypes(include="number").columns]
+            categorical_cols = [str(c) for c in self.df.select_dtypes(exclude="number").columns]
+            lines.append(f"- 数值列: {', '.join(numeric_cols) if numeric_cols else '无'}")
+            lines.append(f"- 分类/非数值列: {', '.join(categorical_cols) if categorical_cols else '无'}")
+            lines.append("- 列信息：")
+            for col in self.df.columns:
+                dtype = str(self.df[col].dtype)
+                null_count = int(self.df[col].isna().sum())
+                unique_count = int(self.df[col].nunique())
+                sample_vals = self.df[col].dropna().head(3).tolist()
+                sample_str = ", ".join(str(v) for v in sample_vals)
+                lines.append(
+                    f"  * {col} (类型: {dtype}, 缺失: {null_count}, "
+                    f"唯一值: {unique_count}) 示例: {sample_str}"
+                )
         return "\n".join(lines)
 
     def _section_examples(self) -> str:
@@ -153,7 +174,10 @@ class LLMRouter:
     # ------------------------------------------------------------------
 
     def route(self, question: str, history: Optional[list] = None) -> dict:
-        """调用 LLM 进行意图路由，返回 {"intent": str, "params": dict, "commentary": str}。"""
+        """调用 LLM 进行意图路由，返回 {"intent": str, "params": dict, "commentary": str}。
+
+        支持指数退避重试：首次失败后等 1s，第二次等 2s。
+        """
         messages = [{"role": "system", "content": self.system_prompt}]
 
         # 包含最近 3 轮对话历史，支持追问
@@ -163,18 +187,31 @@ class LLMRouter:
 
         messages.append({"role": "user", "content": question})
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.1,
-                max_tokens=500,
-                timeout=15.0,
-            )
-            raw = response.choices[0].message.content or ""
-            return self._parse_response(raw)
-        except Exception as e:
-            return {"intent": "error", "params": {}, "commentary": f"LLM 调用失败: {e}"}
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=500,
+                    timeout=self.timeout,
+                )
+                raw = response.choices[0].message.content or ""
+                return self._parse_response(raw)
+            except Exception as e:
+                last_error = e
+                if attempt < self.max_retries:
+                    wait = 2 ** attempt  # 1s, 2s
+                    logger.warning(
+                        "LLM 调用失败 (尝试 %d/%d)，%ds 后重试: %s",
+                        attempt + 1, self.max_retries + 1, wait, e,
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.error("LLM 调用最终失败: %s", e)
+
+        return {"intent": "error", "params": {}, "commentary": f"LLM 调用失败: {last_error}"}
 
     # ------------------------------------------------------------------
     # 响应解析
@@ -211,7 +248,7 @@ class LLMRouter:
 
         if intent not in self.VALID_INTENTS:
             return {
-                "intent": "unsupported",
+                "intent": Intent.UNSUPPORTED,
                 "params": {"requested": str(intent)},
                 "commentary": "当前功能不存在，请在 Agent 中加入新的数据分析功能。",
             }

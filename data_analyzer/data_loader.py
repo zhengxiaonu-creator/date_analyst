@@ -40,10 +40,12 @@ class DataLoader:
             name = file_name or (getattr(file_object, "name", "data") or "data")
             ext = Path(name).suffix.lower()
             if ext == ".csv":
-                return self._load_csv_from_fileobj(file_object, encoding=encoding, **kwargs)
-            if ext in (".xlsx", ".xls"):
-                return pd.read_excel(file_object, sheet_name=sheet_name, **kwargs)
-            raise ValueError(f"不支持的文件格式: {ext}。支持: .csv, .xlsx, .xls")
+                df = self._load_csv_from_fileobj(file_object, encoding=encoding, **kwargs)
+            elif ext in (".xlsx", ".xls"):
+                df = pd.read_excel(file_object, sheet_name=sheet_name, **kwargs)
+            else:
+                raise ValueError(f"不支持的文件格式: {ext}。支持: .csv, .xlsx, .xls")
+            return self._validate_loaded_df(df)
 
         if file_path is None:
             raise ValueError("必须提供 file_path 或 file_object")
@@ -59,8 +61,20 @@ class DataLoader:
             )
 
         if ext == ".csv":
-            return self._load_csv(path, encoding=encoding, **kwargs)
-        return self._load_excel(path, sheet_name=sheet_name, **kwargs)
+            df = self._load_csv(path, encoding=encoding, **kwargs)
+        else:
+            df = self._load_excel(path, sheet_name=sheet_name, **kwargs)
+        return self._validate_loaded_df(df)
+
+    @staticmethod
+    def _validate_loaded_df(df: pd.DataFrame) -> pd.DataFrame:
+        """加载后基础校验：空 DataFrame、重复列名。"""
+        if df.empty:
+            raise ValueError("文件为空（0 行数据）")
+        duplicated = df.columns[df.columns.duplicated()].tolist()
+        if duplicated:
+            raise ValueError(f"存在重复列名: {', '.join(map(str, duplicated))}")
+        return df
 
     def _load_csv(
         self,
